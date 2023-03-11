@@ -2,20 +2,30 @@ import sys
 
 sys.path.append("")
 
-import uasyncio as asyncio
-import aioble
-import bluetooth
 import time
-
 import random
 import struct
+import aioble
+import bluetooth
+import json
+import uasyncio as asyncio
+from machine import Pin
+from hx711_gpio import HX711
+
+# Keys fot the config
+OFFSET = 'offset'
+SCALE = 'scale'
+
+# Where is the HX711 connected
+LOADCELL_DOUT_PIN = 2
+LOADCELL_SCK_PIN = 0
 
 # Progressor service and characteristics.
 PROGRESSOR_UUID                     = bluetooth.UUID("7e4e1701-1ea6-40c9-9dcc-13d34ffead57")
 DATA_CHARACTERISTIC_UUID            = bluetooth.UUID("7e4e1702-1ea6-40c9-9dcc-13d34ffead57")
 CONTROL_POINT_CHARACTERISTIC_UUID   = bluetooth.UUID("7e4e1703-1ea6-40c9-9dcc-13d34ffead57")
 
-# Comandos para el progressor
+# Progressor commands, received from the app.
 CMD_TARE_SCALE = 100 # 0x64 'd'
 CMD_START_WEIGHT_MEAS = 101 # 0x65 'e'
 CMD_STOP_WEIGHT_MEAS = 102 # 0x66 'f'
@@ -28,7 +38,8 @@ CMD_GET_ERROR_INFORMATION = 108 # 0x6c 'l'
 CMD_CLR_ERROR_INFORMATION = 109 # 0x6d 'm'
 CMD_ENTER_SLEEP = 110 # 0x6e 'n'
 
-RES_CMD_RESPONSE = 0
+RES_CMD_RESPONSE = b'\x00'
+RES_CMD_RESPONSE_ERROR = b'\x05'
 RES_WEIGHT_MEAS = 1
 RES_RFD_PEAK = 2
 RES_RFD_PEAK_SERIES = 3
@@ -42,7 +53,7 @@ _ADV_INTERVAL_MS = 250_000
 progressor_service = aioble.Service(PROGRESSOR_UUID)
 
 control_characteristic = aioble.Characteristic(
-    progressor_service, CONTROL_POINT_CHARACTERISTIC_UUID, write=True
+    progressor_service, CONTROL_POINT_CHARACTERISTIC_UUID, write=True, read=True
 )
 data_characteristic = aioble.Characteristic(
     progressor_service, DATA_CHARACTERISTIC_UUID, notify=True
@@ -50,22 +61,48 @@ data_characteristic = aioble.Characteristic(
 
 aioble.register_services(progressor_service)
 
-# Controla la task de envio de datos
+# Control if data is being sent to the app.
 send_data = False
 
-# Timestamp de inicio de la medición
+# Store timestamp from the start of measurements
 start_meas = 0
 
 
-weight = 24.5
+def save_config():
+    """Save the config file"""
+    with open(CONFIG_FILE, 'w') as f:
+        json.dump(config, f)
+
+# Read config from file
+CONFIG_FILE = 'config.json'
+# If the config file exists, read it.
+try:
+    with open(CONFIG_FILE, 'r') as f:
+        config = json.load(f)
+except OSError:
+    # If the file doesn't exist, create it with some defaults.
+    config = {
+        OFFSET: -42130,
+        SCALE: 0.2123,
+    }
+    save_config()
+
+
+# Initialize the HX711.
+pin_OUT = Pin(LOADCELL_DOUT_PIN, Pin.IN, pull=Pin.PULL_DOWN)
+pin_SCK = Pin(LOADCELL_SCK_PIN, Pin.OUT)
+hx711 = HX711(pin_SCK, pin_OUT)
+hx711.set_offset(config[OFFSET])
+hx711.set_scale(config[SCALE])
+
+
 def get_weight():
-    """Simulate a weight sensor."""
-    global weight
-    weight += random.uniform(-0.5, 0.5)
-    return weight
+    """Read the weight sensor
 
+    Do not return negative values
+    """
+    return (hx711.read() - hx711.OFFSET) * hx711.SCALE
 
-# Helper to encode the temperature characteristic encoding (sint16, hundredths of a degree).
 def _encode_weight_values(weights):
     """Encode a list of weight measurements.
 
@@ -102,9 +139,15 @@ async def sensor_task(connection):
                 # Calcular cuanto es ese tiempo por si debemos controlarlo.
                 # https://docs.micropython.org/en/latest/library/time.html#time.ticks_ms
                 weights.append((get_weight(), time.ticks_diff(time.ticks_us(), start_meas)))
-                await asyncio.sleep_ms(10)
 
-            data_characteristic.notify(connection, _encode_weight_values(weights))
+            # Give time to pass the control to other tasks.
+            await asyncio.sleep_ms(1)
+
+            try:
+                data_characteristic.notify(connection, _encode_weight_values(weights))
+            except Exception as e:
+                print("Error sending data, stop sending data", e)
+                break
 
         else:
             await asyncio.sleep_ms(500)
@@ -112,54 +155,86 @@ async def sensor_task(connection):
 async def control_task(connection):
     global send_data, start_meas
 
+    # List of calibration points, used to calibrate the scale.
+    calibration_points = []
+
     try:
         with connection.timeout(None):
             while True:
                 print("Waiting for control message")
                 await control_characteristic.written()
                 msg = control_characteristic.read()
-                control_characteristic.write(b"")
 
-                if ord(msg) == CMD_START_WEIGHT_MEAS:
+                cmd = struct.unpack('<B', msg)[0]
+
+                if cmd == CMD_START_WEIGHT_MEAS:
                     print("CMD_START_WEIGHT_MEAS")
                     start_meas = time.ticks_us()
                     send_data = True
 
-                elif ord(msg) == CMD_STOP_WEIGHT_MEAS:
+                elif cmd == CMD_STOP_WEIGHT_MEAS:
                     print("CMD_STOP_WEIGHT_MEAS")
                     send_data = False
 
-                elif ord(msg) == CMD_TARE_SCALE:
-                    print("CMD_TARE_SCALE TODO")
+                elif cmd == CMD_TARE_SCALE:
+                    # This command is not used by the phone app.
+                    print("CMD_TARE_SCALE")
+                    hx711.tare()
 
-                elif ord(msg) == CMD_START_PEAK_RFD_MEAS:
+                elif cmd == CMD_START_PEAK_RFD_MEAS:
                     print("CMD_START_PEAK_RFD_MEAS TODO")
 
-                elif ord(msg) == CMD_START_PEAK_RFD_MEAS_SERIES:
+                elif cmd == CMD_START_PEAK_RFD_MEAS_SERIES:
                     print("CMD_START_PEAK_RFD_MEAS_SERIES TODO")
 
-                elif ord(msg) == CMD_ADD_CALIBRATION_POINT:
-                    print("CMD_ADD_CALIBRATION_POINT TODO")
+                elif cmd == CMD_ADD_CALIBRATION_POINT:
+                    # This command is used to calibrate the scale.
+                    # The app sends the weight being used.
+                    # We store this value and the current raw measure.
+                    weight_kg = struct.unpack('<f', msg[1:5])[0]
+                    calibration_points.append((weight_kg, hx711.read()))
+                    print(f"CMD_ADD_CALIBRATION_POINT: {calibration_points}")
 
-                elif ord(msg) == CMD_SAVE_CALIBRATION:
-                    print("CMD_SAVE_CALIBRATION TODO")
+                elif cmd == CMD_SAVE_CALIBRATION:
+                    # This command uses the last two calibration_points to calculate the scale and offset.
+                    if len(calibration_points) < 2:
+                        print("Not enough calibration points")
+                        control_characteristic.write(RES_CMD_RESPONSE_ERROR)
+                        continue
 
-                elif ord(msg) == CMD_GET_ERROR_INFORMATION:
+                    weight1, raw1 = calibration_points[-2]
+                    weight2, raw2 = calibration_points[-1]
+
+                    # Solve equation: weight = (raw - offset) * scale
+                    scale = (weight2 - weight1) / (raw2 - raw1)
+                    offset = raw1 - weight1 / scale
+                    config[SCALE] = scale
+                    config[OFFSET] = offset
+                    save_config()
+
+                    hx711.set_scale(scale)
+                    hx711.set_offset(offset)
+
+                    print(f"CMD_SAVE_CALIBRATION: {config}")
+
+                elif cmd == CMD_GET_ERROR_INFORMATION:
                     print("CMD_GET_ERROR_INFORMATION TODO")
 
-                elif ord(msg) == CMD_CLR_ERROR_INFORMATION:
+                elif cmd == CMD_CLR_ERROR_INFORMATION:
                     print("CMD_CLR_ERROR_INFORMATION TODO")
 
-                elif ord(msg) == CMD_ENTER_SLEEP:
+                elif cmd == CMD_ENTER_SLEEP:
                     print("CMD_ENTER_SLEEP")
                     send_data = False
 
-                elif ord(msg) == CMD_GET_APP_VERSION:
+                elif cmd == CMD_GET_APP_VERSION:
                     print("CMD_GET_APP_VERSION")
                     control_characteristic.notify(connection, b"1")
 
                 else:
-                    print(f"Comando desconocido: {ord(msg)}")
+                    print(f"Unknown command: {cmd}")
+
+                control_characteristic.write(RES_CMD_RESPONSE)
 
     except aioble.DeviceDisconnectedError:
         return
@@ -184,6 +259,7 @@ async def peripheral_task():
             t.cancel()
 
             await connection.disconnected()
+            print("Disconnection from", connection.device)
             send_data = False
 
 
